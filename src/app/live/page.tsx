@@ -5,6 +5,7 @@
 import { Suspense, useEffect, useRef, useState } from 'react';
 
 import Hls from 'hls.js';
+import mpegts from 'mpegts.js';
 import { Heart, Menu, Radio, RefreshCw, Search, Tv, X, ChevronDown, ChevronUp } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Tabs, Tab, Box } from '@mui/material';
@@ -30,10 +31,11 @@ import { parseCustomTimeFormat } from '@/lib/time';
 import EpgScrollableRow from '@/components/EpgScrollableRow';
 import PageLayout from '@/components/PageLayout';
 
-// 扩展 HTMLVideoElement 类型以支持 hls 属性
+// 扩展 HTMLVideoElement 类型以支持 hls 和 mpegtsPlayer 属性
 declare global {
   interface HTMLVideoElement {
     hls?: any;
+    mpegtsPlayer?: any;
   }
 }
 
@@ -884,6 +886,19 @@ function LivePageClient() {
           }
         }
 
+        // 销毁 mpegts.js 实例
+        if (artPlayerRef.current.video && artPlayerRef.current.video.mpegtsPlayer) {
+          try {
+            artPlayerRef.current.video.mpegtsPlayer.unload();
+            artPlayerRef.current.video.mpegtsPlayer.detachMediaElement();
+            artPlayerRef.current.video.mpegtsPlayer.destroy();
+            artPlayerRef.current.video.mpegtsPlayer = null;
+          } catch (mpegtsError) {
+            console.warn('mpegts实例销毁时出错:', mpegtsError);
+            artPlayerRef.current.video.mpegtsPlayer = null;
+          }
+        }
+
         // 移除所有事件监听器
         artPlayerRef.current.off('ready');
         artPlayerRef.current.off('loadstart');
@@ -1446,6 +1461,111 @@ function LivePageClient() {
     });
   }
 
+  // 检测直播流类型 (flv, ts, m3u8 等)
+  function detectStreamType(url: string): 'flv' | 'ts' | 'm3u8' | 'unknown' {
+    const lowerUrl = url.toLowerCase();
+
+    // 检查 URL 路径或参数
+    if (lowerUrl.includes('.flv') || lowerUrl.includes('flv=1') || lowerUrl.includes('/flv/')) {
+      return 'flv';
+    }
+    if (lowerUrl.includes('.ts') && !lowerUrl.includes('.m3u8')) {
+      return 'ts';
+    }
+    if (lowerUrl.includes('.m3u8') || lowerUrl.includes('m3u8')) {
+      return 'm3u8';
+    }
+
+    // 默认返回 unknown，让播放器自动检测
+    return 'unknown';
+  }
+
+  // mpegts.js loader (支持 FLV 和 MPEG-TS 直播流)
+  function mpegtsLoader(video: HTMLVideoElement, url: string, type: 'flv' | 'ts' | 'mse') {
+    if (!mpegts.isSupported()) {
+      console.error('mpegts.js 不支持当前浏览器');
+      setUnsupportedType('browser-unsupported');
+      return;
+    }
+
+    // 清理之前的 mpegts 实例
+    if (video.mpegtsPlayer) {
+      try {
+        video.mpegtsPlayer.unload();
+        video.mpegtsPlayer.detachMediaElement();
+        video.mpegtsPlayer.destroy();
+        video.mpegtsPlayer = null;
+      } catch (err) {
+        console.warn('清理 mpegts 实例时出错:', err);
+      }
+    }
+
+    console.log(`🎬 [mpegts.js] 创建播放器: type=${type}, url=${url.substring(0, 80)}...`);
+
+    // 创建 mpegts 播放器
+    const player = mpegts.createPlayer({
+      type: type,  // 'flv', 'ts', 或 'mse'
+      isLive: true,
+      cors: true,
+      url: url,
+    }, {
+      enableWorker: !isMobile && devicePerformance !== 'low',
+      enableStashBuffer: true,
+      stashInitialSize: 128 * 1024,  // 128KB
+      liveBufferLatencyChasing: true,
+      liveBufferLatencyMaxLatency: 1.5,
+      liveBufferLatencyMinRemain: 0.5,
+      lazyLoad: false,  // 直播流不使用 lazy load
+      autoCleanupSourceBuffer: true,
+      autoCleanupMaxBackwardDuration: 60,
+      autoCleanupMinBackwardDuration: 30,
+    });
+
+    // 绑定到 video 元素
+    player.attachMediaElement(video);
+    player.load();
+
+    // 保存引用以便清理
+    video.mpegtsPlayer = player;
+
+    // 监听事件
+    player.on(mpegts.Events.ERROR, (errorType: any, errorDetail: any, errorInfo: any) => {
+      console.error(`[mpegts.js] Error: ${errorType} - ${errorDetail}`, errorInfo);
+
+      if (errorType === mpegts.ErrorTypes.NETWORK_ERROR) {
+        console.warn('[mpegts.js] 网络错误，尝试重连...');
+        // 尝试重连
+        setTimeout(() => {
+          try {
+            player.unload();
+            player.load();
+          } catch (e) {
+            console.error('[mpegts.js] 重连失败:', e);
+          }
+        }, 2000);
+      } else if (errorType === mpegts.ErrorTypes.MEDIA_ERROR) {
+        console.error('[mpegts.js] 媒体错误');
+        setUnsupportedType('media-error');
+        setIsVideoLoading(false);
+      }
+    });
+
+    player.on(mpegts.Events.LOADING_COMPLETE, () => {
+      console.log('[mpegts.js] 加载完成');
+    });
+
+    player.on(mpegts.Events.MEDIA_INFO, (mediaInfo: any) => {
+      console.log('[mpegts.js] 媒体信息:', mediaInfo);
+      setIsVideoLoading(false);
+    });
+
+    player.on(mpegts.Events.STATISTICS_INFO, (stats: any) => {
+      if (process.env.NODE_ENV === 'development' && stats.speed) {
+        console.log(`[mpegts.js] 速度: ${(stats.speed / 1024).toFixed(2)} KB/s`);
+      }
+    });
+  }
+
   // 播放器初始化
   useEffect(() => {
     // 异步初始化播放器，避免SSR问题
@@ -1472,6 +1592,10 @@ function LivePageClient() {
       // 重置不支持的类型
       setUnsupportedType(null);
 
+      // 🔍 检测直播流类型
+      const streamType = detectStreamType(videoUrl);
+      console.log(`🔍 检测到直播流类型: ${streamType}`);
+
       // 🚀 智能选择直连或代理模式
       const useDirect = await shouldUseDirectPlayback(videoUrl);
       const targetUrl = useDirect
@@ -1480,7 +1604,33 @@ function LivePageClient() {
 
       console.log(`🎬 播放模式: ${useDirect ? '⚡ 直连' : '🔄 代理'} | URL: ${targetUrl.substring(0, 100)}...`);
 
-      const customType = { m3u8: m3u8Loader };
+      // 根据流类型选择 loader
+      const isFLVorTS = streamType === 'flv' || streamType === 'ts';
+      const mpegtsType = streamType === 'flv' ? 'flv' : streamType === 'ts' ? 'mse' : 'mse';
+
+      // 自定义类型 loader
+      const customType: Record<string, (video: HTMLVideoElement, url: string) => void> = {
+        m3u8: m3u8Loader,
+      };
+
+      // 如果是 FLV/TS，添加对应的 loader
+      if (isFLVorTS && mpegts.isSupported()) {
+        customType.flv = (video: HTMLVideoElement, url: string) => mpegtsLoader(video, url, 'flv');
+        customType.ts = (video: HTMLVideoElement, url: string) => mpegtsLoader(video, url, 'mse');
+      }
+
+      // 确定播放器使用的 type
+      let playerType: string;
+      if (isFLVorTS && mpegts.isSupported()) {
+        playerType = streamType; // 'flv' 或 'ts'
+        console.log(`🎬 使用 mpegts.js 播放 ${streamType.toUpperCase()} 流`);
+      } else {
+        playerType = 'm3u8';  // 默认使用 hls.js
+        if (isFLVorTS && !mpegts.isSupported()) {
+          console.warn(`⚠️ 浏览器不支持 mpegts.js，尝试使用 hls.js 播放`);
+        }
+      }
+
       try {
         // 使用动态导入的 Artplayer
         const Artplayer = (window as any).DynamicArtplayer;
@@ -1524,7 +1674,7 @@ function LivePageClient() {
             crossOrigin: 'anonymous',
             preload: 'metadata',
           },
-          type: 'm3u8',
+          type: playerType,
           customType: customType,
           icons: {
             loading:
@@ -1962,7 +2112,7 @@ function LivePageClient() {
                         </h3>
                         <div className='bg-orange-500/20 border border-orange-500/30 rounded-lg p-4'>
                           <p className='text-orange-300 font-medium'>
-                            {unsupportedType === 'channel-unavailable' 
+                            {unsupportedType === 'channel-unavailable'
                               ? '频道可能需要特殊访问权限或链接已过期'
                               : `当前频道直播流类型：${unsupportedType.toUpperCase()}`
                             }
@@ -1970,7 +2120,7 @@ function LivePageClient() {
                           <p className='text-sm text-orange-200 mt-2'>
                             {unsupportedType === 'channel-unavailable'
                               ? '请联系IPTV提供商或尝试其他频道'
-                              : '目前仅支持 M3U8 格式的直播流'
+                              : '目前支持 M3U8/HLS、FLV、MPEG-TS 格式'
                             }
                           </p>
                         </div>
