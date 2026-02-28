@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 'use client';
 
-import React, { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useImperativeHandle, useMemo, useRef } from 'react';
 import { VirtuosoGrid, VirtuosoGridHandle } from 'react-virtuoso';
 
 import { DoubanItem } from '@/lib/types';
@@ -84,11 +84,6 @@ export const VirtualDoubanGrid = React.forwardRef<VirtualDoubanGridRef, VirtualD
     ref,
   ) => {
     const virtuosoRef = useRef<VirtuosoGridHandle>(null);
-    const [scrollParent, setScrollParent] = useState<HTMLElement | null>(null);
-
-    useEffect(() => {
-      setScrollParent(document.documentElement as HTMLElement);
-    }, []);
 
     const imagesToPreload = useMemo(() => {
       return doubanData
@@ -175,8 +170,9 @@ export const VirtualDoubanGrid = React.forwardRef<VirtualDoubanGridRef, VirtualD
     return (
       <VirtuosoGrid
         ref={virtuosoRef}
-        customScrollParent={scrollParent ?? undefined}
+        useWindowScroll
         data={doubanData}
+        initialItemCount={doubanData.length || 25}
         overscan={{ main: OVERSCAN, reverse: Math.round(OVERSCAN * 0.85) }}
         increaseViewportBy={{ top: Math.round(OVERSCAN * 0.45), bottom: Math.round(OVERSCAN * 0.75) }}
         endReached={() => {
